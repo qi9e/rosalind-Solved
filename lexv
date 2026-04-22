@@ -1,0 +1,25 @@
+with open('rosalind_lexv.txt', 'r') as f:
+    content = f.read().splitlines()
+
+
+alphabet = content[0].split()
+n = int(content[1])
+
+result = []
+
+def dfs(cur):
+    if len(cur) > 0:
+        result.append(cur)
+
+    if len(cur) == n:
+        return
+
+    for ch in alphabet:
+        dfs(cur + ch)
+
+dfs('')
+
+for s in result:
+    with open('lexvOUT.txt', 'a') as f:
+        f.write(s + '\n')
+        
