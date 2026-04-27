@@ -1,0 +1,156 @@
+#include "fsl_device_registers.h"
+#include "fsl_debug_console.h"
+#include "fsl_lpi2c.h"
+#include "fsl_clock.h"
+#include "pin_mux.h"
+#include "clock_config.h"
+#include "board.h"
+
+/* ========== MPU6050 寄存器 ========== */
+#define MPU6050_ADDR         0x68    // AD0=GND
+#define MPU6050_WHO_AM_I     0x75    // 应返回 0x68
+#define MPU6050_PWR_MGMT_1   0x6B
+#define MPU6050_SMPLRT_DIV   0x19
+#define MPU6050_CONFIG       0x1A
+#define MPU6050_GYRO_CONFIG  0x1B
+#define MPU6050_ACCEL_CONFIG 0x1C
+#define MPU6050_ACCEL_XOUT_H 0x3B    // 数据起始地址
+
+/* ========== I2C 配置 ========== */
+#define I2C_BASE        LPI2C0
+#define I2C_BAUDRATE    400000U
+
+
+/* ========== 原始数据结构 ========== */
+typedef struct {
+    int16_t accel_x, accel_y, accel_z;
+    int16_t temp;
+    int16_t gyro_x, gyro_y, gyro_z;
+} mpu6050_raw_t;
+
+/* ========== I2C 读写函数 ========== */
+static status_t MPU_WriteReg(uint8_t reg, uint8_t value)
+{
+    lpi2c_master_transfer_t xfer = {0};
+    xfer.slaveAddress   = MPU6050_ADDR;
+    xfer.direction      = kLPI2C_Write;
+    xfer.subaddress     = reg;
+    xfer.subaddressSize = 1;
+    xfer.data           = &value;
+    xfer.dataSize       = 1;
+    xfer.flags          = kLPI2C_TransferDefaultFlag;
+    return LPI2C_MasterTransferBlocking(I2C_BASE, &xfer);
+}
+
+static status_t MPU_ReadRegs(uint8_t reg, uint8_t *buf, size_t len)
+{
+    lpi2c_master_transfer_t xfer = {0};
+    xfer.slaveAddress   = MPU6050_ADDR;
+    xfer.direction      = kLPI2C_Read;
+    xfer.subaddress     = reg;
+    xfer.subaddressSize = 1;
+    xfer.data           = buf;
+    xfer.dataSize       = len;
+    xfer.flags          = kLPI2C_TransferDefaultFlag;
+    return LPI2C_MasterTransferBlocking(I2C_BASE, &xfer);
+}
+
+/* ========== I2C 初始化 ========== */
+static void I2C_Init(void)
+{
+    /* 配置 LPI2C0 时钟：FRO12M → LPI2C0，分频比 1 */
+    CLOCK_SetClockDiv(kCLOCK_DivLPI2C0, 1U);
+    CLOCK_AttachClk(kFRO12M_to_LPI2C0);
+
+    lpi2c_master_config_t cfg;
+    LPI2C_MasterGetDefaultConfig(&cfg);
+    cfg.baudRate_Hz = I2C_BAUDRATE;
+    LPI2C_MasterInit(I2C_BASE, &cfg, CLOCK_GetLpi2cClkFreq());
+}
+
+/* ========== MPU6050 初始化 ========== */
+static int MPU6050_Init(void)
+{
+    uint8_t who = 0;
+
+    /* 1. 检测设备 */
+    if (MPU_ReadRegs(MPU6050_WHO_AM_I, &who, 1) != kStatus_Success) {
+        PRINTF("[MPU6050] I2C read failed!\r\n");
+        return -1;
+    }
+    PRINTF("[MPU6050] WHO_AM_I = 0x%02X\r\n", who);
+    /* 兼容 MPU6050(0x68) / MPU6500(0x70) / MPU9250(0x71) */
+    if (who != 0x68 && who != 0x70 && who != 0x71) {
+        PRINTF("[MPU6050] Unknown device ID!\r\n");
+        return -2;
+    }
+
+    /* 2. 复位 + 等待 */
+    MPU_WriteReg(MPU6050_PWR_MGMT_1, 0x80);
+    SDK_DelayAtLeastUs(100000, SystemCoreClock);
+
+    /* 3. 唤醒 + 选时钟源(PLL with X gyro) */
+    MPU_WriteReg(MPU6050_PWR_MGMT_1, 0x01);
+
+    /* 4. 采样率 1kHz/(1+7) = 125Hz */
+    MPU_WriteReg(MPU6050_SMPLRT_DIV, 0x07);
+
+    /* 5. DLPF 44Hz */
+    MPU_WriteReg(MPU6050_CONFIG, 0x03);
+
+    /* 6. 陀螺仪量程 ±500°/s */
+    MPU_WriteReg(MPU6050_GYRO_CONFIG, 0x08);
+
+    /* 7. 加速度量程 ±4g */
+    MPU_WriteReg(MPU6050_ACCEL_CONFIG, 0x08);
+
+    PRINTF("[MPU6050] Init OK!\r\n");
+    return 0;
+}
+
+/* ========== 一次读 14 字节原始数据 ========== */
+static int MPU6050_ReadRaw(mpu6050_raw_t *raw)
+{
+    uint8_t buf[14];
+    if (MPU_ReadRegs(MPU6050_ACCEL_XOUT_H, buf, 14) != kStatus_Success) {
+        return -1;
+    }
+    raw->accel_x = (int16_t)((buf[0]  << 8) | buf[1]);
+    raw->accel_y = (int16_t)((buf[2]  << 8) | buf[3]);
+    raw->accel_z = (int16_t)((buf[4]  << 8) | buf[5]);
+    raw->temp    = (int16_t)((buf[6]  << 8) | buf[7]);
+    raw->gyro_x  = (int16_t)((buf[8]  << 8) | buf[9]);
+    raw->gyro_y  = (int16_t)((buf[10] << 8) | buf[11]);
+    raw->gyro_z  = (int16_t)((buf[12] << 8) | buf[13]);
+    return 0;
+}
+
+/* ========== 主函数 ========== */
+int main(void)
+{
+    BOARD_InitBootPins();
+    BOARD_InitBootClocks();
+    BOARD_InitDebugConsole();
+
+    PRINTF("\r\n=== FRDM-MCXA153 + MPU6050 Raw Data ===\r\n");
+
+    I2C_Init();
+
+    if (MPU6050_Init() != 0) {
+        PRINTF("MPU6050 init failed, halt.\r\n");
+        while (1) {}
+    }
+
+    mpu6050_raw_t raw;
+
+    while (1) {
+        if (MPU6050_ReadRaw(&raw) == 0) {
+            PRINTF("Acc: %6d %6d %6d | Gyro: %6d %6d %6d\r\n",
+                   raw.accel_x, raw.accel_y, raw.accel_z,
+                   raw.gyro_x,  raw.gyro_y,  raw.gyro_z);
+        } else {
+            PRINTF("I2C read error\r\n");
+        }
+        SDK_DelayAtLeastUs(100000, SystemCoreClock);  // 100ms
+    }
+}
